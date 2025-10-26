@@ -1,818 +1,664 @@
+#!/usr/bin/env python3
+"""
+DCM Trading Bot - Binance Futures Perpetual Trading Bot
+Implements Dollar Cost Mean (DCM) contrarian strategy
+"""
+
 import os
 import time
 import logging
 import json
 from datetime import datetime, timedelta
-from binance.client import Client
-from binance.exceptions import BinanceAPIException, BinanceRequestException
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
 import pandas as pd
 import numpy as np
-from typing import Optional, Dict, Any
-import requests.exceptions
-import socket
+from binance.client import Client
+from binance.exceptions import BinanceAPIException, BinanceOrderException
+import requests
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(f'{datetime.now().strftime("%Y-%m-%d")}logs.txt'),
+        logging.FileHandler('dcm_bot.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
+@dataclass
 class BotConfig:
-    def __init__(self):
-        # Strategy parameters from document
-        self.ma_period = 100
-        self.symbol = "ASTERUSDT"  # Changed from SPXUSDT as per logs
-        self.initial_order_size = 20.0  # USDT
-        self.dcm_percent = 0.035  # 3.5%
-        self.tp_percent = 0.025  # 2.5%
-        self.sl_percent = 0.025  # 2.5%
-        self.maturation_bars = 50
-        self.k1 = 1000
-        self.exp = 1.1
-        self.k2 = 10
-        self.max_order_size = 100.0  # USDT
-        self.max_series = 50  # Maximum series limit
-        self.timeframe = "5m"
-        
-        # Risk management
-        self.max_position_value = 5000.0  # Maximum position value in USDT
-        self.max_daily_loss = 500.0  # Maximum daily loss in USDT
-        
-        # Connection settings
-        self.max_retries = 3
-        self.retry_delay = 5  # seconds
-        self.connection_timeout = 30  # seconds
-        
-        # Rate limiting
-        self.api_call_delay = 0.1  # seconds between API calls
-        self.last_api_call = 0
+    """Configuration class for DCM Trading Bot"""
+    pair: str = "ASTERUSDT"
+    ma_period: int = 100
+    initial_order_size: float = 10.0
+    dcm_percent: float = 0.5
+    tp_percent: float = 0.7
+    sl_percent: float = 0.7
+    maturation_bars: int = 20
+    max_series: int = 30  # Maximum series limit
+    k1: float = 1000.0
+    exp: float = 1.1
+    k2: float = 10.0
+    max_order_size: float = 100.0
+    timeframe: str = "5m"
 
-class TradeHistory:
-    def __init__(self, filename="trade_history.json"):
-        self.filename = filename
-        self.trades = []
-        self.load_history()
-        
-    def load_history(self):
-        """Load trade history from file"""
-        try:
-            if os.path.exists(self.filename):
-                with open(self.filename, 'r') as f:
-                    self.trades = json.load(f)
-                logger.info(f"Loaded {len(self.trades)} trades from history")
-        except Exception as e:
-            logger.error(f"Error loading trade history: {e}")
-            self.trades = []
-            
-    def save_history(self):
-        """Save trade history to file"""
-        try:
-            with open(self.filename, 'w') as f:
-                json.dump(self.trades, f, indent=2, default=str)
-        except Exception as e:
-            logger.error(f"Error saving trade history: {e}")
-            
-    def add_trade(self, trade_data):
-        """Add a trade to history"""
-        trade_data['timestamp'] = datetime.now().isoformat()
-        self.trades.append(trade_data)
-        self.save_history()
-        
-    def get_daily_pnl(self, date=None):
-        """Get daily PnL"""
-        if date is None:
-            date = datetime.now().date()
-            
-        daily_trades = [t for t in self.trades 
-                       if datetime.fromisoformat(t['timestamp']).date() == date]
-        
-        return sum(t.get('pnl', 0) for t in daily_trades)
+@dataclass
+class Position:
+    """Position tracking class"""
+    side: str  # 'LONG' or 'SHORT'
+    series_count: int = 0
+    total_size: float = 0.0
+    total_cost: float = 0.0
+    avg_price: float = 0.0
+    matured: bool = False
+    tp_order_id: Optional[str] = None
+    sl_order_id: Optional[str] = None
+    consecutive_between_dcm: int = 0
+    last_accumulation_bar: int = 0
 
-class DCMBot:
-    def __init__(self, config):
+class DCMTradingBot:
+    """DCM Trading Bot Implementation"""
+    
+    def __init__(self, config: BotConfig):
         self.config = config
-        self.trade_history = TradeHistory()
-        
-        # Initialize Binance client with retry logic
         self.client = None
-        self.initialize_client()
-        
-        # Position tracking
-        self.position_side = None  # 'LONG' or 'SHORT'
-        self.position_size = 0.0  # Total position size in base asset
-        self.position_cost = 0.0  # Total cost in USDT
-        self.series_count = 0
-        self.matured = False
-        self.tp_order_id = None
-        self.sl_order_id = None
-        
-        # Price data
-        self.prices = []
-        self.ma_values = []
-        
-        # Consecutive closes tracking
-        self.consecutive_neutral_closes = 0
-        
-        # Symbol info
+        self.position: Optional[Position] = None
+        self.price_history: List[float] = []
+        self.ma_history: List[float] = []
+        self.current_bar = 0
+        self.trade_history: List[Dict] = []
         self.symbol_info = None
-        self.price_precision = 4
-        self.qty_precision = 1
-        self.min_qty = 0.001
-        self.tick_size = 0.0001
         
-        # Risk management
-        self.daily_start_balance = 0.0
-        self.session_start_time = datetime.now()
-        
-        # Connection management
-        self.last_successful_connection = datetime.now()
-        self.connection_errors = 0
-        
-        self.initialize_symbol_info()
-        self.initialize_account_info()
-        
-    def initialize_client(self):
-        """Initialize Binance client with error handling"""
+        # Initialize Binance client
+        self._initialize_client()
+    
+    def _initialize_client(self):
+        """Initialize Binance Futures client"""
         try:
-            self.client = Client(
-                api_key=os.getenv('BINANCE_API_KEY'),
-                api_secret=os.getenv('BINANCE_SECRET_KEY'),
-                requests_params={'timeout': self.config.connection_timeout}
-            )
+            api_key = os.getenv('BINANCE_API_KEY')
+            api_secret = os.getenv('BINANCE_API_SECRET')
+            
+            if not api_key or not api_secret:
+                raise ValueError("Binance API credentials not found in environment variables")
+            
+            self.client = Client(api_key, api_secret)
+            self.client.API_URL = 'https://fapi.binance.com'
             
             # Test connection
-            self.client.futures_ping()
-            logger.info("Binance client initialized successfully")
+            account_info = self.client.futures_account()
+            logger.info("Successfully connected to Binance Futures API")
+            
+            # Log account balance
+            balance = float(account_info['totalWalletBalance'])
+            logger.info(f"Account balance: {balance} USDT")
+            
+            # Get symbol info for precision
+            self._get_symbol_info()
+            
+            # Set leverage to 1x
+            self.client.futures_change_leverage(symbol=self.config.pair, leverage=1)
+            logger.info(f"Set leverage to 1x for {self.config.pair}")
             
         except Exception as e:
             logger.error(f"Failed to initialize Binance client: {e}")
             raise
-            
-    def rate_limit_check(self):
-        """Implement rate limiting"""
-        current_time = time.time()
-        time_since_last_call = current_time - self.config.last_api_call
-        
-        if time_since_last_call < self.config.api_call_delay:
-            sleep_time = self.config.api_call_delay - time_since_last_call
-            time.sleep(sleep_time)
-            
-        self.config.last_api_call = time.time()
-        
-    def api_call_with_retry(self, func, *args, **kwargs):
-        """Execute API call with retry logic"""
-        for attempt in range(self.config.max_retries):
-            try:
-                self.rate_limit_check()
-                result = func(*args, **kwargs)
-                self.connection_errors = 0
-                self.last_successful_connection = datetime.now()
-                return result
-                
-            except (BinanceRequestException, requests.exceptions.RequestException, 
-                    socket.timeout, ConnectionError) as e:
-                self.connection_errors += 1
-                logger.warning(f"API call failed (attempt {attempt + 1}/{self.config.max_retries}): {e}")
-                
-                if attempt < self.config.max_retries - 1:
-                    sleep_time = self.config.retry_delay * (2 ** attempt)  # Exponential backoff
-                    logger.info(f"Retrying in {sleep_time} seconds...")
-                    time.sleep(sleep_time)
-                else:
-                    logger.error(f"API call failed after {self.config.max_retries} attempts")
-                    raise
-                    
-            except BinanceAPIException as e:
-                if e.code in [-1021, -1001]:  # Timestamp or connectivity issues
-                    logger.warning(f"Timestamp/connectivity error: {e}")
-                    if attempt < self.config.max_retries - 1:
-                        time.sleep(self.config.retry_delay)
-                        continue
-                raise
-                
-    def initialize_symbol_info(self):
+    
+    def _get_symbol_info(self):
         """Get symbol information for precision"""
         try:
-            exchange_info = self.api_call_with_retry(self.client.futures_exchange_info)
-            
+            exchange_info = self.client.futures_exchange_info()
             for symbol in exchange_info['symbols']:
-                if symbol['symbol'] == self.config.symbol:
+                if symbol['symbol'] == self.config.pair:
                     self.symbol_info = symbol
-                    
-                    # Get precision info
-                    for filter_info in symbol['filters']:
-                        if filter_info['filterType'] == 'PRICE_FILTER':
-                            self.tick_size = float(filter_info['tickSize'])
-                            self.price_precision = len(str(self.tick_size).rstrip('0').split('.')[-1])
-                        elif filter_info['filterType'] == 'LOT_SIZE':
-                            step_size = float(filter_info['stepSize'])
-                            self.qty_precision = len(str(step_size).rstrip('0').split('.')[-1])
-                            self.min_qty = float(filter_info['minQty'])
                     break
-                    
-            logger.info(f"Symbol info initialized - Price precision: {self.price_precision}, "
-                       f"Qty precision: {self.qty_precision}, Min qty: {self.min_qty}")
+            
+            if not self.symbol_info:
+                raise ValueError(f"Symbol {self.config.pair} not found")
             
         except Exception as e:
-            logger.error(f"Error getting symbol info: {e}")
-            # Use defaults if API fails
-            self.price_precision = 4
-            self.qty_precision = 1
-            self.min_qty = 0.001
-            
-    def initialize_account_info(self):
-        """Initialize account information"""
+            logger.error(f"Failed to get symbol info: {e}")
+            raise
+    
+    def _round_quantity(self, quantity: float) -> float:
+        """Round quantity according to symbol precision"""
+        if not self.symbol_info:
+            return round(quantity, 6)
+        
+        for filter_info in self.symbol_info['filters']:
+            if filter_info['filterType'] == 'LOT_SIZE':
+                step_size = float(filter_info['stepSize'])
+                precision = len(str(step_size).split('.')[-1].rstrip('0'))
+                return round(quantity, precision)
+        
+        return round(quantity, 6)
+    
+    def get_current_price(self) -> float:
+        """Get current price for the trading pair"""
         try:
-            account_info = self.api_call_with_retry(self.client.futures_account)
-            self.daily_start_balance = float(account_info['totalWalletBalance'])
-            logger.info(f"Account initialized - Balance: {self.daily_start_balance:.2f} USDT")
-            
-        except Exception as e:
-            logger.error(f"Error getting account info: {e}")
-            
-    def get_current_price(self):
-        """Get current price with error handling"""
-        try:
-            ticker = self.api_call_with_retry(
-                self.client.futures_symbol_ticker, 
-                symbol=self.config.symbol
-            )
+            ticker = self.client.futures_symbol_ticker(symbol=self.config.pair)
             return float(ticker['price'])
-            
         except Exception as e:
-            logger.error(f"Error getting current price: {e}")
-            return None
-            
-    def get_klines(self):
-        """Get historical klines with error handling"""
+            logger.error(f"Failed to get current price: {e}")
+            raise
+    
+    def get_historical_data(self, limit: int = 150) -> pd.DataFrame:
+        """Get historical kline data"""
         try:
-            klines = self.api_call_with_retry(
-                self.client.futures_klines,
-                symbol=self.config.symbol,
+            klines = self.client.futures_klines(
+                symbol=self.config.pair,
                 interval=self.config.timeframe,
-                limit=self.config.ma_period + 10
+                limit=limit
             )
             
-            closes = [float(kline[4]) for kline in klines]
-            return closes
+            df = pd.DataFrame(klines, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'number_of_trades',
+                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+            ])
             
+            df['close'] = df['close'].astype(float)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            
+            return df
+        
         except Exception as e:
-            logger.error(f"Error getting klines: {e}")
-            return None
-            
-    def calculate_ma(self, prices):
+            logger.error(f"Failed to get historical data: {e}")
+            raise
+    
+    def calculate_ma(self, prices: List[float], period: int) -> float:
         """Calculate Simple Moving Average"""
-        if len(prices) >= self.config.ma_period:
-            return sum(prices[-self.config.ma_period:]) / self.config.ma_period
-        return None
-        
-    def calculate_dcm_levels(self, ma):
+        if len(prices) < period:
+            return sum(prices) / len(prices)
+        return sum(prices[-period:]) / period
+    
+    def calculate_dcm_levels(self, ma: float) -> Tuple[float, float]:
         """Calculate DCM levels"""
-        upper_dcm = ma * (1 + self.config.dcm_percent)
-        lower_dcm = ma * (1 - self.config.dcm_percent)
+        dcm_range = ma * (self.config.dcm_percent / 100)
+        upper_dcm = ma + dcm_range
+        lower_dcm = ma - dcm_range
         return upper_dcm, lower_dcm
-        
-    def calculate_order_size(self, current_price):
-        """Calculate order size using exponential formula"""
-        if self.series_count == 0:
+    
+    def calculate_position_size(self, current_price: float) -> float:
+        """Calculate position size using DCM formula"""
+        if not self.position or self.position.total_size == 0:
             return self.config.initial_order_size
-            
-        # Calculate average cost per piece
-        if self.position_size > 0:
-            avg_cost = self.position_cost / self.position_size
-            
-            # Exponential formula: (Initial + (|avg_cost - current_price| / avg_cost) * k1)^exp * k2
-            price_diff_ratio = abs(avg_cost - current_price) / avg_cost
-            order_size = ((self.config.initial_order_size + price_diff_ratio * self.config.k1) ** self.config.exp) * self.config.k2
-            
-            # Cap at maximum order size
-            order_size = min(order_size, self.config.max_order_size)
-            
-            # Risk management: check if new position would exceed limits
-            potential_position_value = self.position_cost + order_size
-            if potential_position_value > self.config.max_position_value:
-                order_size = max(0, self.config.max_position_value - self.position_cost)
-                logger.warning(f"Order size reduced due to position limit: {order_size:.2f}")
-            
-            logger.info(f"Exponential calculation: avg_cost={avg_cost:.6f}, "
-                       f"price_diff_ratio={price_diff_ratio:.6f}, order_size={order_size:.2f}")
-            return order_size
-        else:
-            return self.config.initial_order_size
-            
-    def check_risk_limits(self):
-        """Check if risk limits are exceeded"""
-        # Check daily loss limit
-        daily_pnl = self.trade_history.get_daily_pnl()
-        if daily_pnl < -self.config.max_daily_loss:
-            logger.error(f"Daily loss limit exceeded: {daily_pnl:.2f} USDT")
-            return False
-            
-        # Check connection health
-        time_since_last_connection = datetime.now() - self.last_successful_connection
-        if time_since_last_connection > timedelta(minutes=10):
-            logger.error("Connection health check failed")
-            return False
-            
-        return True
         
-    def round_price(self, price):
-        """Round price to proper precision"""
-        return round(price / self.tick_size) * self.tick_size
+        avg_cost = self.position.avg_price
+        price_diff_ratio = abs(avg_cost - current_price) / avg_cost
         
-    def round_quantity(self, quantity):
-        """Round quantity to proper precision"""
-        return round(quantity, self.qty_precision)
+        size_usd = (self.config.initial_order_size + (price_diff_ratio * self.config.k1)) ** self.config.exp * self.config.k2
         
-    def place_market_order(self, side, size_usd, current_price):
-        """Place market order with comprehensive error handling"""
+        return min(size_usd, self.config.max_order_size)
+    
+    def place_market_order(self, side: str, size_usd: float, current_price: float) -> Dict:
+        """Place market order with proper quantity calculation"""
         try:
-            # Calculate quantity in base asset
+            # Calculate quantity in base asset terms
             quantity = size_usd / current_price
-            quantity = self.round_quantity(quantity)
+            quantity = self._round_quantity(quantity)
             
-            if quantity < self.min_qty:
-                logger.error(f"Quantity {quantity} below minimum {self.min_qty}")
-                return None
-                
-            logger.info(f"Placing {side} order: {quantity} {self.config.symbol} "
-                       f"(${size_usd:.2f} at ~{current_price})")
-            
-            order = self.api_call_with_retry(
-                self.client.futures_create_order,
-                symbol=self.config.symbol,
+            order = self.client.futures_create_order(
+                symbol=self.config.pair,
                 side=side,
                 type='MARKET',
                 quantity=quantity
             )
             
-            # Get executed quantity and price
-            executed_qty = float(order.get('executedQty', 0))
+            logger.info(f"Market order placed: {side} {quantity} {self.config.pair} at ~{current_price}")
             
-            if executed_qty > 0:
-                # Get fill price from order info
-                order_info = self.api_call_with_retry(
-                    self.client.futures_get_order,
-                    symbol=self.config.symbol,
-                    orderId=order['orderId']
-                )
-                
-                if order_info['status'] == 'FILLED':
-                    avg_price = float(order_info['avgPrice'])
-                    logger.info(f"Order filled: {executed_qty} at {avg_price}")
-                    
-                    # Save to trade history
-                    trade_data = {
-                        'symbol': self.config.symbol,
-                        'side': side,
-                        'quantity': executed_qty,
-                        'price': avg_price,
-                        'value': executed_qty * avg_price,
-                        'order_id': order['orderId'],
-                        'series_count': self.series_count
-                    }
-                    self.trade_history.add_trade(trade_data)
-                    
-                    return {
-                        'quantity': executed_qty,
-                        'price': avg_price,
-                        'side': side,
-                        'orderId': order['orderId']
-                    }
-                else:
-                    logger.error(f"Order not filled: {order_info['status']}")
-                    return None
-            else:
-                logger.error(f"Invalid executed quantity: {executed_qty}")
-                return None
-                
+            # Debug: Log the full order response
+            logger.debug(f"Order response: {order}")
+            
+            # Check if order was filled
+            if 'executedQty' not in order or float(order['executedQty']) == 0:
+                # Try to get order status
+                try:
+                    order_status = self.client.futures_get_order(
+                        symbol=self.config.pair,
+                        orderId=order['orderId']
+                    )
+                    logger.debug(f"Order status: {order_status}")
+                    if 'executedQty' in order_status:
+                        order['executedQty'] = order_status['executedQty']
+                except Exception as e:
+                    logger.warning(f"Could not get order status: {e}")
+            
+            return order
+        
         except BinanceAPIException as e:
             logger.error(f"Binance API error placing market order: {e}")
-            return None
+            raise
         except Exception as e:
             logger.error(f"Error placing market order: {e}")
-            return None
-            
-    def update_position(self, order_result):
-        """Update position tracking with validation"""
-        if not order_result:
+            raise
+    
+    def place_tp_sl_orders(self):
+        """Place Take Profit and Stop Loss orders"""
+        if not self.position:
             return
-            
-        quantity = order_result['quantity']
-        price = order_result['price']
-        side = order_result['side']
         
-        # Validate order result
-        if quantity <= 0 or price <= 0:
-            logger.error(f"Invalid order result: qty={quantity}, price={price}")
-            return
-            
-        if side == 'BUY':
-            self.position_size += quantity
-            self.position_cost += quantity * price
-            logger.info(f"Accumulated BUY: +{quantity:.6f} at {price:.6f}")
-        elif side == 'SELL':
-            self.position_size -= quantity
-            self.position_cost -= quantity * price
-            logger.info(f"Accumulated SELL: -{quantity:.6f} at {price:.6f}")
-            
-        # Log position summary
-        if self.position_size != 0:
-            avg_cost = self.position_cost / self.position_size
-            logger.info(f"Position Summary: Size={self.position_size:.6f}, "
-                       f"Cost={self.position_cost:.2f}, AvgCost={avg_cost:.6f}")
-            
-    def get_position_pnl(self, current_price):
-        """Calculate position PnL with validation"""
-        if self.position_size == 0:
-            return 0.0
-            
-        if self.position_side == 'LONG':
-            pnl = (current_price * self.position_size) - self.position_cost
-        else:  # SHORT
-            pnl = self.position_cost - (current_price * self.position_size)
-            
-        return pnl
-        
-    def place_tp_sl_orders(self, current_price):
-        """Place TP and SL orders after maturation with proper error handling"""
         try:
-            if self.position_size == 0:
-                return
-                
-            avg_cost = self.position_cost / self.position_size
+            current_price = self.get_current_price()
             
-            if self.position_side == 'LONG':
-                tp_price = avg_cost * (1 + self.config.tp_percent)
-                sl_price = avg_cost * (1 - self.config.sl_percent)
+            if self.position.side == 'LONG':
+                tp_price = self.position.avg_price * (1 + self.config.tp_percent / 100)
+                sl_price = self.position.avg_price * (1 - self.config.sl_percent / 100)
                 tp_side = 'SELL'
                 sl_side = 'SELL'
             else:  # SHORT
-                tp_price = avg_cost * (1 - self.config.tp_percent)
-                sl_price = avg_cost * (1 + self.config.sl_percent)
+                tp_price = self.position.avg_price * (1 - self.config.tp_percent / 100)
+                sl_price = self.position.avg_price * (1 + self.config.sl_percent / 100)
                 tp_side = 'BUY'
                 sl_side = 'BUY'
-                
-            # Round prices to proper precision
-            tp_price = self.round_price(tp_price)
-            sl_price = self.round_price(sl_price)
-            quantity = self.round_quantity(abs(self.position_size))
             
-            # Validate prices
-            if tp_price <= 0 or sl_price <= 0 or quantity <= 0:
-                logger.error(f"Invalid TP/SL parameters: tp={tp_price}, sl={sl_price}, qty={quantity}")
-                return
-                
-            # Place TP order (limit)
-            try:
-                tp_order = self.api_call_with_retry(
-                    self.client.futures_create_order,
-                    symbol=self.config.symbol,
-                    side=tp_side,
-                    type='LIMIT',
-                    timeInForce='GTC',
-                    quantity=quantity,
-                    price=tp_price
+            quantity = self._round_quantity(self.position.total_size)
+            
+            # Place TP order
+            tp_order = self.client.futures_create_order(
+                symbol=self.config.pair,
+                side=tp_side,
+                type='LIMIT',
+                timeInForce='GTC',
+                quantity=quantity,
+                price=f"{tp_price:.6f}"
+            )
+            self.position.tp_order_id = tp_order['orderId']
+            
+            # Place SL order
+            sl_order = self.client.futures_create_order(
+                symbol=self.config.pair,
+                side=sl_side,
+                type='STOP_MARKET',
+                quantity=quantity,
+                stopPrice=f"{sl_price:.6f}"
+            )
+            self.position.sl_order_id = sl_order['orderId']
+            
+            logger.info(f"TP/SL orders placed: TP@{tp_price:.6f}, SL@{sl_price:.6f}")
+        
+        except Exception as e:
+            logger.error(f"Error placing TP/SL orders: {e}")
+    
+    def cancel_tp_sl_orders(self):
+        """Cancel existing TP/SL orders"""
+        if not self.position:
+            return
+        
+        try:
+            if self.position.tp_order_id:
+                self.client.futures_cancel_order(
+                    symbol=self.config.pair,
+                    orderId=self.position.tp_order_id
                 )
-                self.tp_order_id = tp_order['orderId']
-                logger.info(f"TP order placed: {tp_side} {quantity} at {tp_price} (ID:{self.tp_order_id})")
-                
-            except Exception as e:
-                logger.error(f"Error placing TP order: {e}")
-                
-            # Place SL order (stop market)
-            try:
-                sl_order = self.api_call_with_retry(
-                    self.client.futures_create_order,
-                    symbol=self.config.symbol,
-                    side=sl_side,
-                    type='STOP_MARKET',
-                    quantity=quantity,
-                    stopPrice=sl_price
+                self.position.tp_order_id = None
+            
+            if self.position.sl_order_id:
+                self.client.futures_cancel_order(
+                    symbol=self.config.pair,
+                    orderId=self.position.sl_order_id
                 )
-                self.sl_order_id = sl_order['orderId']
-                logger.info(f"SL order placed: {sl_side} {quantity} at {sl_price} (ID:{self.sl_order_id})")
-                
-            except Exception as e:
-                logger.error(f"Error placing SL order: {e}")
-                
+                self.position.sl_order_id = None
+        
         except Exception as e:
-            logger.error(f"Error in place_tp_sl_orders: {e}")
-            
-    def check_tp_sl_hit(self):
-        """Check if TP or SL orders were filled"""
+            logger.warning(f"Error canceling TP/SL orders: {e}")
+    
+    def close_position(self, reason: str = "Manual"):
+        """Close current position"""
+        if not self.position:
+            return
+        
         try:
-            if not self.tp_order_id and not self.sl_order_id:
-                return False
-                
-            # Check TP order
-            if self.tp_order_id:
-                try:
-                    tp_order = self.api_call_with_retry(
-                        self.client.futures_get_order,
-                        symbol=self.config.symbol,
-                        orderId=self.tp_order_id
-                    )
-                    if tp_order['status'] == 'FILLED':
-                        logger.info(f"TP HIT! Order {self.tp_order_id} filled at {tp_order['avgPrice']}")
-                        self.close_all_positions("TP Hit")
-                        return True
-                except Exception as e:
-                    logger.error(f"Error checking TP order: {e}")
-                    
-            # Check SL order
-            if self.sl_order_id:
-                try:
-                    sl_order = self.api_call_with_retry(
-                        self.client.futures_get_order,
-                        symbol=self.config.symbol,
-                        orderId=self.sl_order_id
-                    )
-                    if sl_order['status'] == 'FILLED':
-                        logger.info(f"SL HIT! Order {self.sl_order_id} filled at {sl_order['avgPrice']}")
-                        self.close_all_positions("SL Hit")
-                        return True
-                except Exception as e:
-                    logger.error(f"Error checking SL order: {e}")
-                    
-            return False
+            current_price = self.get_current_price()
             
-        except Exception as e:
-            logger.error(f"Error in check_tp_sl_hit: {e}")
-            return False
+            # Cancel TP/SL orders first
+            self.cancel_tp_sl_orders()
             
-    def close_all_positions(self, reason):
-        """Close all positions and reset with comprehensive error handling"""
-        try:
-            if self.position_size != 0:
-                # Cancel existing TP/SL orders
-                if self.tp_order_id:
-                    try:
-                        self.api_call_with_retry(
-                            self.client.futures_cancel_order,
-                            symbol=self.config.symbol,
-                            orderId=self.tp_order_id
-                        )
-                        logger.info(f"TP order {self.tp_order_id} cancelled")
-                    except Exception as e:
-                        logger.warning(f"Could not cancel TP order: {e}")
-                        
-                if self.sl_order_id:
-                    try:
-                        self.api_call_with_retry(
-                            self.client.futures_cancel_order,
-                            symbol=self.config.symbol,
-                            orderId=self.sl_order_id
-                        )
-                        logger.info(f"SL order {self.sl_order_id} cancelled")
-                    except Exception as e:
-                        logger.warning(f"Could not cancel SL order: {e}")
-                
-                # Close position with market order
-                current_price = self.get_current_price()
-                if current_price:
-                    pnl = self.get_position_pnl(current_price)
-                    pnl_percent = (pnl / abs(self.position_cost)) * 100 if self.position_cost != 0 else 0
-                    
-                    side = 'SELL' if self.position_size > 0 else 'BUY'
-                    quantity = self.round_quantity(abs(self.position_size))
-                    
-                    if quantity >= self.min_qty:
-                        try:
-                            close_order = self.api_call_with_retry(
-                                self.client.futures_create_order,
-                                symbol=self.config.symbol,
-                                side=side,
-                                type='MARKET',
-                                quantity=quantity
-                            )
-                            
-                            logger.info(f"Position closed: {reason} - PnL: {pnl:.4f} USDT ({pnl_percent:.2f}%)")
-                            
-                            # Save closing trade to history
-                            close_trade_data = {
-                                'symbol': self.config.symbol,
-                                'side': side,
-                                'quantity': quantity,
-                                'price': current_price,
-                                'value': quantity * current_price,
-                                'pnl': pnl,
-                                'pnl_percent': pnl_percent,
-                                'reason': reason,
-                                'series_count': self.series_count,
-                                'type': 'close'
-                            }
-                            self.trade_history.add_trade(close_trade_data)
-                            
-                        except Exception as e:
-                            logger.error(f"Error closing position: {e}")
-                    else:
-                        logger.warning(f"Position size {quantity} too small to close")
-                        
-            # Reset all tracking
-            self.position_side = None
-            self.position_size = 0.0
-            self.position_cost = 0.0
-            self.series_count = 0
-            self.matured = False
-            self.tp_order_id = None
-            self.sl_order_id = None
-            self.consecutive_neutral_closes = 0
+            # Close position with market order
+            close_side = 'SELL' if self.position.side == 'LONG' else 'BUY'
+            quantity = self._round_quantity(self.position.total_size)
             
-            logger.info("Position tracking reset")
-            
-        except Exception as e:
-            logger.error(f"Error in close_all_positions: {e}")
-            
-    def start_new_series(self, side, current_price):
-        """Start a new trading series with validation"""
-        try:
-            # Risk checks
-            if not self.check_risk_limits():
-                logger.warning("Risk limits exceeded, not starting new series")
+            if quantity <= 0:
+                logger.error(f"Cannot close position: invalid quantity {quantity}")
+                self.position = None  # Reset position to prevent further errors
                 return
-                
-            order_size = self.config.initial_order_size
+            
+            order = self.client.futures_create_order(
+                symbol=self.config.pair,
+                side=close_side,
+                type='MARKET',
+                quantity=quantity
+            )
+            
+            # Calculate PnL
+            if self.position.side == 'LONG':
+                pnl = (current_price - self.position.avg_price) * self.position.total_size
+            else:
+                pnl = (self.position.avg_price - current_price) * self.position.total_size
+            
+            pnl_percent = (pnl / self.position.total_cost) * 100
+            
+            # Log trade
+            trade_record = {
+                'timestamp': datetime.now().isoformat(),
+                'side': self.position.side,
+                'series_count': self.position.series_count,
+                'total_size': self.position.total_size,
+                'avg_price': self.position.avg_price,
+                'close_price': current_price,
+                'pnl': pnl,
+                'pnl_percent': pnl_percent,
+                'reason': reason
+            }
+            
+            self.trade_history.append(trade_record)
+            self.save_trade_history()
+            
+            logger.info(f"Position closed: {reason} - PnL: {pnl:.4f} USDT ({pnl_percent:.2f}%)")
+            
+            # Reset position
+            self.position = None
+        
+        except Exception as e:
+            logger.error(f"Error closing position: {e}")
+    
+    def start_new_series(self, side: str, current_price: float):
+        """Start a new trading series"""
+        try:
+            # Convert position side to Binance API side
             api_side = 'BUY' if side == 'LONG' else 'SELL'
             
-            order_result = self.place_market_order(api_side, order_size, current_price)
-            if order_result:
-                self.position_side = side
-                self.series_count = 1
-                self.matured = False
-                self.consecutive_neutral_closes = 0
-                self.update_position(order_result)
-                logger.info(f"Started new {side} series at {current_price}")
+            # Place initial order
+            order = self.place_market_order(api_side, self.config.initial_order_size, current_price)
+            
+            # Initialize position
+            executed_qty = float(order.get('executedQty', 0))
+            if executed_qty <= 0:
+                logger.error(f"Invalid executed quantity: {executed_qty}. Order response: {order}")
+                # Try to get actual position from account
+                try:
+                    positions = self.client.futures_position_information(symbol=self.config.pair)
+                    for pos in positions:
+                        if float(pos['positionAmt']) != 0:
+                            executed_qty = abs(float(pos['positionAmt']))
+                            logger.info(f"Retrieved position size from account: {executed_qty}")
+                            break
+                except Exception as e:
+                    logger.error(f"Could not retrieve position from account: {e}")
                 
+                if executed_qty <= 0:
+                    logger.error("Could not determine valid position size")
+                    return
+            
+            self.position = Position(
+                side=side,
+                series_count=1,
+                total_size=executed_qty,
+                total_cost=self.config.initial_order_size,
+                avg_price=current_price,
+                last_accumulation_bar=self.current_bar
+            )
+            
+            logger.info(f"Started new {side} series - Size: {self.position.total_size:.6f}")
+        
         except Exception as e:
             logger.error(f"Error starting new series: {e}")
+    
+    def manage_existing_position(self, current_price: float, ma: float, upper_dcm: float, lower_dcm: float):
+        """Manage existing position"""
+        if not self.position:
+            return
+        
+        # Check if maximum series limit reached
+        if self.position.series_count >= self.config.max_series:
+            logger.info(f"Maximum series limit ({self.config.max_series}) reached - no more accumulation")
+            return
+        
+        # Increment series count each bar
+        self.position.series_count += 1
+        
+        # Check maturation
+        if not self.position.matured and self.position.series_count >= self.config.maturation_bars:
+            self.position.matured = True
+            self.place_tp_sl_orders()
+            logger.info(f"Position matured at bar {self.position.series_count}")
+        
+        # Check for price crossing MA (closes position in both regimes)
+        if ((self.position.side == 'LONG' and current_price >= ma) or 
+            (self.position.side == 'SHORT' and current_price <= ma)):
+            self.close_position("Price crossed MA")
+            return
+        
+        # Check accumulation conditions
+        should_accumulate = False
+        
+        if self.position.side == 'LONG' and current_price <= lower_dcm:
+            should_accumulate = True
+            self.position.consecutive_between_dcm = 0
+        elif self.position.side == 'SHORT' and current_price >= upper_dcm:
+            should_accumulate = True
+            self.position.consecutive_between_dcm = 0
+        else:
+            # Price is between DCM levels
+            self.position.consecutive_between_dcm += 1
             
-    def accumulate_position(self, current_price):
-        """Accumulate existing position with validation"""
+            # Before maturation: 2 consecutive closes between DCM levels closes position
+            if not self.position.matured and self.position.consecutive_between_dcm >= 2:
+                self.close_position("2 consecutive closes between DCM levels (pre-maturation)")
+                return
+        
+        # Accumulate if conditions are met
+        if should_accumulate:
+            try:
+                size_usd = self.calculate_position_size(current_price)
+                side = 'BUY' if self.position.side == 'LONG' else 'SELL'
+                
+                order = self.place_market_order(side, size_usd, current_price)
+                
+                # Update position
+                new_quantity = float(order['executedQty'])
+                new_cost = size_usd
+                
+                if new_quantity <= 0:
+                    logger.error(f"Invalid executed quantity in accumulation: {new_quantity}")
+                    return
+                
+                total_quantity = self.position.total_size + new_quantity
+                total_cost = self.position.total_cost + new_cost
+                
+                if total_quantity <= 0:
+                    logger.error(f"Invalid total quantity: {total_quantity}")
+                    return
+                
+                self.position.avg_price = total_cost / total_quantity
+                self.position.total_size = total_quantity
+                self.position.total_cost = total_cost
+                self.position.last_accumulation_bar = self.current_bar
+                
+                logger.info(f"Accumulated {side}: +{new_quantity:.6f} at {current_price:.6f}")
+            
+            except Exception as e:
+                logger.error(f"Error accumulating position: {e}")
+    
+    def check_tp_sl_filled(self):
+        """Check if TP or SL orders are filled"""
+        if not self.position:
+            return
+        
         try:
-            if self.series_count >= self.config.max_series:
-                logger.info(f"Maximum series limit ({self.config.max_series}) reached")
-                return
-                
-            # Risk checks
-            if not self.check_risk_limits():
-                logger.warning("Risk limits exceeded, not accumulating")
-                return
-                
-            order_size = self.calculate_order_size(current_price)
-            if order_size <= 0:
-                logger.warning("Calculated order size is 0 or negative")
-                return
-                
-            api_side = 'BUY' if self.position_side == 'LONG' else 'SELL'
+            # Check TP order
+            if self.position.tp_order_id:
+                tp_order = self.client.futures_get_order(
+                    symbol=self.config.pair,
+                    orderId=self.position.tp_order_id
+                )
+                if tp_order['status'] == 'FILLED':
+                    logger.info("Take Profit order filled - closing entire position")
+                    self.close_position("Take Profit hit")
+                    return True
             
-            order_result = self.place_market_order(api_side, order_size, current_price)
-            if order_result:
-                self.update_position(order_result)
-                
+            # Check SL order
+            if self.position.sl_order_id:
+                sl_order = self.client.futures_get_order(
+                    symbol=self.config.pair,
+                    orderId=self.position.sl_order_id
+                )
+                if sl_order['status'] == 'FILLED':
+                    logger.info("Stop Loss order filled - closing entire position")
+                    self.close_position("Stop Loss hit")
+                    return True
+        
         except Exception as e:
-            logger.error(f"Error accumulating position: {e}")
-            
-    def log_system_status(self):
-        """Log system health and status"""
+            logger.warning(f"Error checking TP/SL orders: {e}")
+        
+        return False
+    
+    def calculate_pnl(self, current_price: float) -> float:
+        """Calculate current PnL"""
+        if not self.position or self.position.total_size == 0:
+            return 0.0
+        
+        if self.position.side == 'LONG':
+            return (current_price - self.position.avg_price) * self.position.total_size
+        else:
+            return (self.position.avg_price - current_price) * self.position.total_size
+    
+    def check_pnl_based_exit(self, current_price: float) -> bool:
+        """Check if position should be closed based on PnL thresholds"""
+        if not self.position or not self.position.matured:
+            return False
+        
+        current_pnl = self.calculate_pnl(current_price)
+        pnl_percent = (current_pnl / self.position.total_cost) * 100
+        
+        # Check TP threshold
+        if pnl_percent >= self.config.tp_percent:
+            logger.info(f"PnL-based TP hit: {pnl_percent:.2f}% >= {self.config.tp_percent}%")
+            self.close_position(f"PnL-based TP: {pnl_percent:.2f}%")
+            return True
+        
+        # Check SL threshold
+        if pnl_percent <= -self.config.sl_percent:
+            logger.info(f"PnL-based SL hit: {pnl_percent:.2f}% <= -{self.config.sl_percent}%")
+            self.close_position(f"PnL-based SL: {pnl_percent:.2f}%")
+            return True
+        
+        return False
+    
+    def save_trade_history(self):
+        """Save trade history to file"""
         try:
-            # Account info
-            account_info = self.api_call_with_retry(self.client.futures_account)
-            balance = float(account_info['totalWalletBalance'])
-            
-            # Daily PnL
-            daily_pnl = self.trade_history.get_daily_pnl()
-            
-            # Connection health
-            time_since_last_connection = datetime.now() - self.last_successful_connection
-            
-            logger.info(f"System Status - Balance: {balance:.2f} USDT, "
-                       f"Daily PnL: {daily_pnl:.2f} USDT, "
-                       f"Connection Errors: {self.connection_errors}, "
-                       f"Last Connection: {time_since_last_connection.total_seconds():.0f}s ago")
-                       
+            with open('trade_history.json', 'w') as f:
+                json.dump(self.trade_history, f, indent=2)
         except Exception as e:
-            logger.error(f"Error logging system status: {e}")
-            
+            logger.error(f"Error saving trade history: {e}")
+    
     def run(self):
-        """Main bot loop with comprehensive error handling"""
-        logger.info("DCM Bot started")
-        
-        # Log initial system status
-        self.log_system_status()
-        
-        loop_count = 0
+        """Main trading loop"""
+        logger.info("Starting DCM Trading Bot...")
         
         try:
+            # Load initial historical data
+            df = self.get_historical_data()
+            self.price_history = df['close'].tolist()
+            logger.info(f"Loaded {len(self.price_history)} historical bars")
+            
             while True:
-                loop_count += 1
-                
-                # Log system status every 60 loops (approximately 1 hour)
-                if loop_count % 60 == 0:
-                    self.log_system_status()
-                
-                # Get current data
-                current_price = self.get_current_price()
-                if not current_price:
-                    logger.warning("Could not get current price, retrying...")
-                    time.sleep(30)
-                    continue
+                try:
+                    # Get current price
+                    current_price = self.get_current_price()
                     
-                closes = self.get_klines()
-                if not closes:
-                    logger.warning("Could not get klines, retrying...")
-                    time.sleep(30)
-                    continue
+                    # Update price history
+                    self.price_history.append(current_price)
+                    if len(self.price_history) > 200:  # Keep last 200 bars
+                        self.price_history.pop(0)
                     
-                ma = self.calculate_ma(closes)
-                if not ma:
-                    logger.warning("Could not calculate MA, retrying...")
-                    time.sleep(30)
-                    continue
+                    # Calculate MA
+                    ma = self.calculate_ma(self.price_history, self.config.ma_period)
+                    self.ma_history.append(ma)
                     
-                upper_dcm, lower_dcm = self.calculate_dcm_levels(ma)
-                divergence = ((current_price - ma) / ma) * 100
-                
-                # Check if TP/SL hit (after maturation)
-                if self.matured and (self.tp_order_id or self.sl_order_id):
-                    if self.check_tp_sl_hit():
-                        continue  # Position was closed, continue monitoring
-                        
-                # Calculate PnL
-                pnl = self.get_position_pnl(current_price)
-                
-                # Log current status with additional metrics
-                position_value = abs(self.position_size * current_price) if self.position_size != 0 else 0
-                logger.info(f"Monitor: Price: {current_price:.4f}, MA: {ma:.4f}, "
-                           f"Div: {divergence:.2f}%, Series: {self.series_count}, "
-                           f"PnL: {pnl:.4f}, PosValue: {position_value:.2f}")
-                
-                # Check for price crossing MA (closes all positions)
-                if self.position_side:
-                    if ((self.position_side == 'LONG' and current_price >= ma) or 
-                        (self.position_side == 'SHORT' and current_price <= ma)):
-                        self.close_all_positions("Price crossed MA")
-                        continue
-                        
-                # Check if price is in neutral zone
-                in_neutral_zone = lower_dcm <= current_price <= upper_dcm
-                
-                if self.position_side:
-                    # Existing position logic
-                    self.series_count += 1
+                    # Calculate DCM levels
+                    upper_dcm, lower_dcm = self.calculate_dcm_levels(ma)
                     
-                    if not self.matured and self.series_count >= self.config.maturation_bars:
-                        self.matured = True
-                        logger.info(f"Position matured at bar {self.series_count}")
-                        self.place_tp_sl_orders(current_price)
-                        
-                    if not self.matured:
-                        # Before maturation: check for 2 consecutive neutral closes
-                        if in_neutral_zone:
-                            self.consecutive_neutral_closes += 1
-                            logger.info(f"Neutral close {self.consecutive_neutral_closes}/2")
-                            if self.consecutive_neutral_closes >= 2:
-                                self.close_all_positions("2 consecutive neutral closes")
-                                continue
-                        else:
-                            self.consecutive_neutral_closes = 0
-                            
-                    # Continue accumulating if conditions met
-                    if ((self.position_side == 'LONG' and current_price < lower_dcm) or
-                        (self.position_side == 'SHORT' and current_price > upper_dcm)):
-                        self.accumulate_position(current_price)
-                        
-                else:
-                    # No position: check for new series start
-                    if current_price < lower_dcm:
-                        logger.info(f"Price {current_price:.4f} below lower DCM {lower_dcm:.4f}")
-                        self.start_new_series('LONG', current_price)
-                    elif current_price > upper_dcm:
-                        logger.info(f"Price {current_price:.4f} above upper DCM {upper_dcm:.4f}")
-                        self.start_new_series('SHORT', current_price)
-                        
-                time.sleep(60)  # 1 minute intervals for 5m timeframe
+                    # Calculate divergence
+                    divergence = ((current_price - ma) / ma) * 100
+                    
+                    # Increment bar counter
+                    self.current_bar += 1
+                    
+                    # Check TP/SL orders first
+                    if self.check_tp_sl_filled():
+                        continue  # Position was closed, skip to next iteration
+                    
+                    # Check PnL-based exit conditions
+                    if self.check_pnl_based_exit(current_price):
+                        continue  # Position was closed, skip to next iteration
+                    
+                    # Trading logic
+                    if self.position is None:
+                        # No position - check for entry signals
+                        if current_price <= lower_dcm:
+                            # Start LONG series
+                            self.start_new_series('LONG', current_price)
+                        elif current_price >= upper_dcm:
+                            # Start SHORT series
+                            self.start_new_series('SHORT', current_price)
+                    else:
+                        # Manage existing position
+                        self.manage_existing_position(current_price, ma, upper_dcm, lower_dcm)
+                    
+                    # Calculate current PnL
+                    current_pnl = self.calculate_pnl(current_price)
+                    
+                    # Log monitoring info
+                    series_count = self.position.series_count if self.position else 0
+                    logger.info(
+                        f"Monitor: Price: {current_price:.4f}, MA: {ma:.4f}, "
+                        f"Div: {divergence:.2f}%, Series: {series_count}, PnL: {current_pnl:.4f}"
+                    )
+                    
+                    # Wait for next bar (5 minutes for 5m timeframe)
+                    time.sleep(300)
                 
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-            if self.position_side:
-                self.close_all_positions("Manual stop")
+                except KeyboardInterrupt:
+                    logger.info("Bot stopped by user")
+                    if self.position:
+                        self.close_position("Manual stop")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in main loop: {e}")
+                    time.sleep(10)  # Wait before retrying
+        
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}")
-            if self.position_side:
-                self.close_all_positions("Error stop")
+            logger.error(f"Fatal error: {e}")
             raise
 
+def main():
+    """Main function"""
+    # Configuration
+    config = BotConfig(
+        pair="ASTERUSDT",
+        ma_period=100,
+        initial_order_size=10.0,
+        dcm_percent=0.5,
+        tp_percent=0.7,
+        sl_percent=0.7,
+        maturation_bars=20,
+        max_series=30,
+        k1=1000.0,
+        exp=1.1,
+        k2=10.0,
+        max_order_size=30.0,
+        timeframe="2m"
+    )
+    
+    logger.info(f"DCM Bot initialized with config: {config}")
+    
+    # Create and run bot
+    bot = DCMTradingBot(config)
+    bot.run()
+
 if __name__ == "__main__":
-    try:
-        config = BotConfig()
-        bot = DCMBot(config)
-        bot.run()
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        raise
+    main()
