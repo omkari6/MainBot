@@ -36,7 +36,7 @@ class BotConfig:
     initial_order_size: float = 10.0
     dcm_percent: float = 0.5
     tp_percent: float = 0.7
-    sl_percent: float = 0.35
+    sl_percent: float = 0.7
     maturation_bars: int = 20
     max_series: int = 30  # Maximum series limit
     k1: float = 1000.0
@@ -134,19 +134,6 @@ class DCMTradingBot:
                 return round(quantity, precision)
         
         return round(quantity, 6)
-    
-    def _round_price(self, price: float) -> float:
-        """Round price according to symbol tick size"""
-        if not self.symbol_info:
-            return round(price, 6)
-        
-        for filter_info in self.symbol_info['filters']:
-            if filter_info['filterType'] == 'PRICE_FILTER':
-                tick_size = float(filter_info['tickSize'])
-                precision = len(str(tick_size).split('.')[-1].rstrip('0'))
-                return round(price, precision)
-        
-        return round(price, 6)
     
     def get_current_price(self) -> float:
         """Get current price for the trading pair"""
@@ -267,9 +254,6 @@ class DCMTradingBot:
                 tp_side = 'BUY'
                 sl_side = 'BUY'
             
-            # Round price and quantity
-            tp_price = self._round_price(tp_price)
-            sl_price = self._round_price(sl_price)
             quantity = self._round_quantity(self.position.total_size)
             
             # Place TP order
@@ -279,7 +263,7 @@ class DCMTradingBot:
                 type='LIMIT',
                 timeInForce='GTC',
                 quantity=quantity,
-                price=str(tp_price)
+                price=f"{tp_price:.6f}"
             )
             self.position.tp_order_id = tp_order['orderId']
             
@@ -289,7 +273,7 @@ class DCMTradingBot:
                 side=sl_side,
                 type='STOP_MARKET',
                 quantity=quantity,
-                stopPrice=str(sl_price)
+                stopPrice=f"{sl_price:.6f}"
             )
             self.position.sl_order_id = sl_order['orderId']
             
@@ -501,7 +485,7 @@ class DCMTradingBot:
     def check_tp_sl_filled(self):
         """Check if TP or SL orders are filled"""
         if not self.position:
-            return
+            return False
         
         try:
             # Check TP order
@@ -511,8 +495,18 @@ class DCMTradingBot:
                     orderId=self.position.tp_order_id
                 )
                 if tp_order['status'] == 'FILLED':
-                    logger.info("Take Profit order filled - closing entire position")
-                    self.close_position("Take Profit hit")
+                    logger.info("Take Profit order filled")
+                    # Cancel SL order
+                    if self.position.sl_order_id:
+                        try:
+                            self.client.futures_cancel_order(
+                                symbol=self.config.pair,
+                                orderId=self.position.sl_order_id
+                            )
+                        except:
+                            pass
+                    # Reset position without placing another market order
+                    self.position = None
                     return True
             
             # Check SL order
@@ -522,8 +516,18 @@ class DCMTradingBot:
                     orderId=self.position.sl_order_id
                 )
                 if sl_order['status'] == 'FILLED':
-                    logger.info("Stop Loss order filled - closing entire position")
-                    self.close_position("Stop Loss hit")
+                    logger.info("Stop Loss order filled")
+                    # Cancel TP order
+                    if self.position.tp_order_id:
+                        try:
+                            self.client.futures_cancel_order(
+                                symbol=self.config.pair,
+                                orderId=self.position.tp_order_id
+                            )
+                        except:
+                            pass
+                    # Reset position without placing another market order
+                    self.position = None
                     return True
             
         except Exception as e:
@@ -660,7 +664,7 @@ def main():
         initial_order_size=10.0,
         dcm_percent=0.5,
         tp_percent=0.7,
-        sl_percent=0.35,
+        sl_percent=0.7,
         maturation_bars=20,
         max_series=30,
         k1=1000.0,
